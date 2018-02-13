@@ -2,6 +2,11 @@ package sqlserver
 
 import (
 	"database/sql"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"regexp"
+	"strconv"
 	"sync"
 	"time"
 
@@ -36,6 +41,10 @@ var queries MapQuery
 var isInitialized = false
 
 var defaultServer = "Server=.;app name=telegraf;log=1;"
+
+var counter uint64
+var skips = make(map[string]uint64)
+var sqlFile = flag.String("sqlfile", "./queries.sql", "sql queries")
 
 var sampleConfig = `
   ## Specify instances to monitor with a list of connection strings.
@@ -86,35 +95,62 @@ type scanner interface {
 }
 
 func initQueries(s *SQLServer) {
+	flag.Parse()
 	queries = make(MapQuery)
+	content, err := ioutil.ReadFile(*sqlFile)
 
-	// If this is an AzureDB instance, grab some extra metrics
-	if s.AzureDB {
-		queries["AzureDB"] = Query{Script: sqlAzureDB, ResultByRow: true}
+	if err != nil {
+		fmt.Println(err)
+		fmt.Println("Cannot load SQL file, using default queries...")
+		return
 	}
 
-	// Decide if we want to run version 1 or version 2 queries
-	if s.QueryVersion == 2 {
-		queries["PerformanceCounters"] = Query{Script: sqlPerformanceCountersV2, ResultByRow: true}
-		queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorizedV2, ResultByRow: false}
-		queries["DatabaseIO"] = Query{Script: sqlDatabaseIOV2, ResultByRow: false}
-		queries["ServerProperties"] = Query{Script: sqlServerPropertiesV2, ResultByRow: false}
-		queries["MemoryClerk"] = Query{Script: sqlMemoryClerkV2, ResultByRow: false}
-	} else {
-		queries["PerformanceCounters"] = Query{Script: sqlPerformanceCounters, ResultByRow: true}
-		queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorized, ResultByRow: false}
-		queries["CPUHistory"] = Query{Script: sqlCPUHistory, ResultByRow: false}
-		queries["DatabaseIO"] = Query{Script: sqlDatabaseIO, ResultByRow: false}
-		queries["DatabaseSize"] = Query{Script: sqlDatabaseSize, ResultByRow: false}
-		queries["DatabaseStats"] = Query{Script: sqlDatabaseStats, ResultByRow: false}
-		queries["DatabaseProperties"] = Query{Script: sqlDatabaseProperties, ResultByRow: false}
-		queries["MemoryClerk"] = Query{Script: sqlMemoryClerk, ResultByRow: false}
-		queries["VolumeSpace"] = Query{Script: sqlVolumeSpace, ResultByRow: false}
-		queries["PerformanceMetrics"] = Query{Script: sqlPerformanceMetrics, ResultByRow: false}
+	nlr := regexp.MustCompile(`(\r\n|\r|\n)`)
+	qr := regexp.MustCompile(`(?s)Name: (\w+).+ResultByRow: (\w+).+Skip: (\w+)(.+)`)
+	lines := nlr.Split(string(content), -1)
+	buffer := ""
+
+	for i := len(lines) - 1; i >= 0; i-- {
+		buffer = lines[i] + "\n" + buffer
+		m := qr.FindStringSubmatch(buffer)
+		if len(m) > 0 {
+			queries[m[1]] = Query{Script: m[4], ResultByRow: false}
+			if n, err := strconv.ParseUint(m[3], 10, 64); err == nil {
+				skips[m[1]] = n
+			}
+			buffer = ""
+		}
 	}
 
-	for _, query := range s.ExcludeQuery {
-		delete(queries, query)
+	if len(queries) == 0 {
+		// If this is an AzureDB instance, grab some extra metrics
+		if s.AzureDB {
+			queries["AzureDB"] = Query{Script: sqlAzureDB, ResultByRow: true}
+		}
+
+		// Decide if we want to run version 1 or version 2 queries
+		if s.QueryVersion == 2 {
+			queries["PerformanceCounters"] = Query{Script: sqlPerformanceCountersV2, ResultByRow: true}
+			queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorizedV2, ResultByRow: false}
+			queries["DatabaseIO"] = Query{Script: sqlDatabaseIOV2, ResultByRow: false}
+			queries["ServerProperties"] = Query{Script: sqlServerPropertiesV2, ResultByRow: false}
+			queries["MemoryClerk"] = Query{Script: sqlMemoryClerkV2, ResultByRow: false}
+		} else {
+			queries["PerformanceCounters"] = Query{Script: sqlPerformanceCounters, ResultByRow: true}
+			queries["WaitStatsCategorized"] = Query{Script: sqlWaitStatsCategorized, ResultByRow: false}
+			queries["CPUHistory"] = Query{Script: sqlCPUHistory, ResultByRow: false}
+			queries["DatabaseIO"] = Query{Script: sqlDatabaseIO, ResultByRow: false}
+			queries["DatabaseSize"] = Query{Script: sqlDatabaseSize, ResultByRow: false}
+			queries["DatabaseStats"] = Query{Script: sqlDatabaseStats, ResultByRow: false}
+			queries["DatabaseProperties"] = Query{Script: sqlDatabaseProperties, ResultByRow: false}
+			queries["MemoryClerk"] = Query{Script: sqlMemoryClerk, ResultByRow: false}
+			queries["VolumeSpace"] = Query{Script: sqlVolumeSpace, ResultByRow: false}
+			queries["PerformanceMetrics"] = Query{Script: sqlPerformanceMetrics, ResultByRow: false}
+		}
+
+		for _, query := range s.ExcludeQuery {
+			delete(queries, query)
+		}
 	}
 
 	// Set a flag so we know that queries have already been initialized
@@ -133,8 +169,16 @@ func (s *SQLServer) Gather(acc telegraf.Accumulator) error {
 
 	var wg sync.WaitGroup
 
+	if counter > 1<<32 {
+		counter = 0
+	}
+	counter++
+
 	for _, serv := range s.Servers {
-		for _, query := range queries {
+		for name, query := range queries {
+			if counter%(skips[name]+1) != 0 {
+				continue
+			}
 			wg.Add(1)
 			go func(serv string, query Query) {
 				defer wg.Done()
